@@ -1,0 +1,90 @@
+import cv2
+import numpy as np
+import pywt
+from numpy.linalg import svd
+from skimage.transform import resize
+
+# Tent Map for diffusion
+def tent_map(size, r=0.7, x0=0.3):
+    x = np.zeros(size)
+    x[0] = x0
+    for i in range(1, size):
+        x[i] =  x[i - 1] * r if x[i - 1] < 0.5 else (1 - x[i - 1]) / (1 - r)
+    return np.clip(x, 0, 1)  # Ensure range [0, 1]
+
+# Henon Map for confusion
+def henon_map(size, a=1.4, b=0.3, x0=0.1, y0=0.3):
+    hx, hy = np.zeros(size), np.zeros(size)
+    hx[0], hy[0] = x0, y0
+    for i in range(1, size):
+        hx[i] = 1 - a * hx[i - 1] ** 2 + hy[i - 1]
+        hy[i] = b * hx[i - 1]
+    hy_normalized = (hy - hy.min()) / (hy.max() - hy.min())  # Normalize to [0, 1]
+    
+    return (hy_normalized * 255).astype(np.uint8)  # Scale to [0, 255]
+    
+
+# Encrypt watermark
+def encrypt_watermark(watermark):
+    flat_wm = watermark.flatten().astype(np.uint8)
+    size = len(flat_wm)
+    
+    X = tent_map(size)
+    Y = henon_map(size)
+    
+    perm_indices = np.argsort(X)
+    perm_wm = flat_wm[perm_indices]
+    enc_wm = np.bitwise_xor(perm_wm, Y)
+    cv2.imwrite('en_watermark1.webp',enc_wm.reshape(watermark.shape))
+    return enc_wm.reshape(watermark.shape)
+
+# Process watermark with 2D-DWT
+def process_watermark(watermark):
+    coeffs_wm = pywt.dwt2(watermark, 'haar')
+    LL_wm, _ = coeffs_wm
+    return LL_wm
+
+# Embed watermark
+def embed_watermark(host, watermark, alpha=0.1):
+    coeffs = pywt.dwt2(host, 'haar')
+    LL, (LH, HL, HH) = coeffs
+    
+    U, S, Vt = svd(LL)
+    LL_wm = process_watermark(watermark)
+    Uw, Sw, Vtw = svd(LL_wm)
+    
+    # Pad or truncate Sw to match S
+    if len(Sw) < len(S):
+        Sw = np.pad(Sw, (0, len(S) - len(Sw)), 'constant')
+    else:
+        Sw = Sw[:len(S)]
+    S_new = S + alpha * Sw
+
+    LL_new = U @ np.diag(S_new) @ Vt
+    watermarked = pywt.idwt2((LL_new, (LH, HL, HH)), 'haar')
+    return np.clip(watermarked, 0, 255).astype(np.uint8)
+
+# Main function
+def watermark_image(host_path, watermark_path, output_path, alpha=0.1):
+    host = cv2.imread(host_path, cv2.IMREAD_UNCHANGED)
+    watermark = cv2.imread(watermark_path, cv2.IMREAD_GRAYSCALE)
+    
+    # Ensure even dimensions for DWT
+    h, w = host.shape[:2]
+    watermark = cv2.resize(watermark, (w // 2, h // 2))
+    encrypted_wm = encrypt_watermark(watermark)
+    
+    if len(host.shape) == 3:  # Color image
+        channels = cv2.split(host)
+        print (channels)
+        watermarked_channels = [embed_watermark(ch, encrypted_wm, alpha) for ch in channels]
+        watermarked_img = cv2.merge(watermarked_channels)
+    else:  # Grayscale image
+        watermarked_img = embed_watermark(host, encrypted_wm, alpha)
+    
+    cv2.imwrite(output_path, watermarked_img)
+    print(f'Watermarked image saved at {output_path}')
+
+# Example usage
+
+watermark_image('colour img.webp', 'grey watermark.webp', 'output.webp')
