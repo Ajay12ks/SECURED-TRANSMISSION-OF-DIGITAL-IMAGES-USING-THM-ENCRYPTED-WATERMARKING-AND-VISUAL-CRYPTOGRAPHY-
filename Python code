@@ -1,90 +1,487 @@
-import cv2
+!pip install pywavelets qrcode
+
 import numpy as np
 import pywt
 from numpy.linalg import svd
-from skimage.transform import resize
+import matplotlib.pyplot as plt
+import cv2
+import qrcode
+from PIL import Image
+from skimage.metrics import structural_similarity as ssim
+from scipy.stats import entropy as scipy_entropy
 
-# Tent Map for diffusion
-def tent_map(size, r=0.7, x0=0.3):
+# Tent Map with configurable parameters
+def tent_map(size, x0, alpha):
     x = np.zeros(size)
     x[0] = x0
     for i in range(1, size):
-        x[i] =  x[i - 1] * r if x[i - 1] < 0.5 else (1 - x[i - 1]) / (1 - r)
-    return np.clip(x, 0, 1)  # Ensure range [0, 1]
+        if 0 < x[i-1] <= alpha:
+            x[i] = x[i-1] / alpha
+        elif alpha < x[i-1] < 1:
+            x[i] = (1 - x[i-1]) / (1 - alpha)
+        else:
+            x[i] = 0
+    return np.clip(x, 0, 1)
 
-# Henon Map for confusion
-def henon_map(size, a=1.4, b=0.3, x0=0.1, y0=0.3):
+# Henon Map with configurable parameters
+def henon_map(size, x0, y0, alpha, beta):
     hx, hy = np.zeros(size), np.zeros(size)
     hx[0], hy[0] = x0, y0
     for i in range(1, size):
-        hx[i] = 1 - a * hx[i - 1] ** 2 + hy[i - 1]
-        hy[i] = b * hx[i - 1]
-    hy_normalized = (hy - hy.min()) / (hy.max() - hy.min())  # Normalize to [0, 1]
-    
-    return (hy_normalized * 255).astype(np.uint8)  # Scale to [0, 255]
-    
+        hx[i] = 1 - alpha * hx[i-1]**2 + hy[i-1]
+        hy[i] = beta * hx[i]
+    hy_normalized = (hy - hy.min()) / (hy.max() - hy.min())
+    return hy_normalized
 
-# Encrypt watermark
-def encrypt_watermark(watermark):
-    flat_wm = watermark.flatten().astype(np.uint8)
-    size = len(flat_wm)
-    
-    X = tent_map(size)
-    Y = henon_map(size)
-    
-    perm_indices = np.argsort(X)
-    perm_wm = flat_wm[perm_indices]
-    enc_wm = np.bitwise_xor(perm_wm, Y)
-    cv2.imwrite('en_watermark1.webp',enc_wm.reshape(watermark.shape))
-    return enc_wm.reshape(watermark.shape)
+# Convert chaotic sequence to binary matrix
+def to_binary_matrix(sequence, shape=(45, 45)):
+    binary = (sequence >= 0.5).astype(np.uint8)
+    return binary.reshape(shape)
 
-# Process watermark with 2D-DWT
-def process_watermark(watermark):
-    coeffs_wm = pywt.dwt2(watermark, 'haar')
-    LL_wm, _ = coeffs_wm
-    return LL_wm
+# Generate encryption key keyTHM with configurable parameters
+def generate_key_thm(size=45*45, tent_x0=0.36, tent_alpha=1.98,
+                    henon_x0=0.1, henon_y0=0.3, henon_alpha=1.4, henon_beta=0.314):
+    tent_seq = tent_map(size, x0=tent_x0, alpha=tent_alpha)
+    henon_seq = henon_map(size, x0=henon_x0, y0=henon_y0, alpha=henon_alpha, beta=henon_beta)
+    T2 = to_binary_matrix(tent_seq, shape=(45, 45))
+    H2 = to_binary_matrix(henon_seq, shape=(45, 45))
+    keyTHM = np.bitwise_xor(T2, H2)
+    return keyTHM
 
-# Embed watermark
-def embed_watermark(host, watermark, alpha=0.1):
-    coeffs = pywt.dwt2(host, 'haar')
-    LL, (LH, HL, HH) = coeffs
-    
-    U, S, Vt = svd(LL)
-    LL_wm = process_watermark(watermark)
-    Uw, Sw, Vtw = svd(LL_wm)
-    
-    # Pad or truncate Sw to match S
-    if len(Sw) < len(S):
-        Sw = np.pad(Sw, (0, len(S) - len(Sw)), 'constant')
+# Encrypt watermark using the new THM algorithm
+def encrypt_watermark(watermark, tent_x0=0.36, tent_alpha=0.98,
+                     henon_x0=0.1, henon_y0=0.3, henon_alpha=1.4, henon_beta=0.314):
+    Wb = (watermark > 127).astype(np.uint8)  # Binarize grayscale watermark
+    keyTHM = generate_key_thm(tent_x0=tent_x0, tent_alpha=tent_alpha,
+                             henon_x0=henon_x0, henon_y0=henon_y0,
+                             henon_alpha=henon_alpha, henon_beta=henon_beta)
+    We = np.bitwise_xor(Wb, keyTHM)
+    print("Encrypted watermark bits:", We.flatten()[:10], "...")
+    return We, keyTHM
+
+# Decrypt watermark
+def decrypt_watermark(enc_watermark_extracted, keyTHM):
+    Wb = np.bitwise_xor(enc_watermark_extracted, keyTHM)
+    dec_wm = np.where(Wb > 0, 255, 0).astype(np.uint8)
+    print("Decrypted watermark bits:", Wb.flatten()[:10], "...")
+    return dec_wm
+
+# Embedding function for grayscale or color images
+def embed_watermark(image, enc_watermark, T, channel=2):
+    is_color = len(image.shape) == 3  # Check if image is color (RGB)
+
+    if is_color:
+        image_float = image.astype(float)
+        roi = image_float[:, :, channel]
     else:
-        Sw = Sw[:len(S)]
-    S_new = S + alpha * Sw
+        roi = image.astype(float)
 
-    LL_new = U @ np.diag(S_new) @ Vt
-    watermarked = pywt.idwt2((LL_new, (LH, HL, HH)), 'haar')
-    return np.clip(watermarked, 0, 255).astype(np.uint8)
+    coeffs = pywt.dwt2(roi, 'haar')
+    LL, (LH, HL, HH) = coeffs
 
-# Main function
-def watermark_image(host_path, watermark_path, output_path, alpha=0.1):
-    host = cv2.imread(host_path, cv2.IMREAD_UNCHANGED)
-    watermark = cv2.imread(watermark_path, cv2.IMREAD_GRAYSCALE)
-    
-    # Ensure even dimensions for DWT
-    h, w = host.shape[:2]
-    watermark = cv2.resize(watermark, (w // 2, h // 2))
-    encrypted_wm = encrypt_watermark(watermark)
-    
-    if len(host.shape) == 3:  # Color image
-        channels = cv2.split(host)
-        print (channels)
-        watermarked_channels = [embed_watermark(ch, encrypted_wm, alpha) for ch in channels]
-        watermarked_img = cv2.merge(watermarked_channels)
+    h, w = LL.shape
+    blocks = LL.reshape(h // 4, 4, w // 4, 4).swapaxes(1, 2).reshape(-1, 4, 4)
+
+    watermark_bits = enc_watermark.flatten()
+    num_bits = len(watermark_bits)
+    print(f"Number of watermark bits: {num_bits}, Number of blocks: {len(blocks)}")
+    print(f"Watermark bits (first 10): {watermark_bits[:10]}")
+    if num_bits > len(blocks):
+        raise ValueError("Watermark too large for available blocks")
+
+    for i in range(num_bits):
+        U, S, V = svd(blocks[i])
+        bit = watermark_bits[i]
+        if bit == 0:
+            if U[1, 0] <= U[2, 0]:
+                U[1, 0], U[2, 0] = U[2, 0], U[1, 0]
+            if U[1, 0] - U[2, 0] < T:
+                U[1, 0] += T / 2
+                U[2, 0] -= T / 2
+        else:
+            if U[1, 0] > U[2, 0]:
+                U[1, 0], U[2, 0] = U[2, 0], U[1, 0]
+            if U[2, 0] - U[1, 0] < T:
+                U[1, 0] -= T / 2
+                U[2, 0] += T / 2
+        blocks[i] = U @ np.diag(S) @ V
+        if i < 10:
+            print(f"Block {i}: U[1,0]={U[1,0]:.6f}, U[2,0]={U[2,0]:.6f}, Bit={bit}")
+
+    LL_modified = blocks.reshape(h // 4, w // 4, 4, 4).swapaxes(1, 2).reshape(h, w)
+    coeffs_modified = (LL_modified, (LH, HL, HH))
+    roi_modified = pywt.idwt2(coeffs_modified, 'haar')
+
+    if is_color:
+        image_float[:, :, channel] = roi_modified
+        result = np.clip(image_float, 0, 255).astype(np.uint8)
+    else:
+        result = np.clip(roi_modified, 0, 255).astype(np.uint8)
+
+    return result, watermark_bits  # Return watermark_bits for debugging
+
+# Extraction function for grayscale or color images
+def extract_watermark(watermarked_image, T, watermark_size=(45, 45), channel=2):
+    is_color = len(watermarked_image.shape) == 3
+
+    if is_color:
+        roi = watermarked_image[:, :, channel].astype(float)
+    else:
+        roi = watermarked_image.astype(float)
+
+    coeffs = pywt.dwt2(roi, 'haar')
+    LL, _ = coeffs
+
+    h, w = LL.shape
+    blocks = LL.reshape(h // 4, 4, w // 4, 4).swapaxes(1, 2).reshape(-1, 4, 4)
+
+    num_bits = watermark_size[0] * watermark_size[1]
+    extracted_bits = np.zeros(num_bits, dtype=np.uint8)
+    for i in range(min(num_bits, len(blocks))):
+        U, _, _ = svd(blocks[i])
+        diff = U[1, 0] - U[2, 0]
+        extracted_bits[i] = 0 if diff >= -T/2 else 1  # Adjusted for more tolerance
+        if i < 10:
+            print(f"Extracted bit {i}: {extracted_bits[i]} (diff={diff:.6f}, T/2={T/2:.6f})")
+
+    enc_watermark_extracted = extracted_bits.reshape(watermark_size)
+    return enc_watermark_extracted, extracted_bits
+
+# QR watermark generator
+def generate_qr_watermark(patient_data):
+    qr = qrcode.QRCode(
+        version=6,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=1,
+        border=4
+    )
+    qr.add_data(patient_data)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert('L')
+    qr_array = np.array(qr_img)
+    qr_array = qr_array[4:49, 4:49]
+    qr_array = np.where(qr_array > 127, 255, 0).astype(np.uint8)
+    return qr_array
+
+# Convert binary matrix (keyTHM) to QR code
+def key_to_qr_code(keyTHM):
+    # Convert the binary matrix into a string of 0s and 1s
+    data = ''.join(keyTHM.astype(str).flatten())
+    qr = qrcode.QRCode(
+        version=6,  # QR Version 6 allows for 45x45 code
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=10,
+        border=4
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    return qr.make_image(fill_color="black", back_color="white")
+
+# Secret sharing using XOR for (n,n) scheme
+def generate_shares(secret, n):
+    shares = []
+    current = secret.copy()
+    for i in range(n - 1):
+        rand = np.random.randint(0, 2, secret.shape, dtype=np.uint8)
+        shares.append(rand)
+        current = np.bitwise_xor(current, rand)
+    shares.append(current)
+    return shares
+
+# XOR-based reconstruction
+def reconstruct_secret(shares):
+    result = shares[0].copy()
+    for share in shares[1:]:
+        result = np.bitwise_xor(result, share)
+    return result
+
+# Save a QR code image
+def save_qr_code_image(qr_code, filename):
+    qr_code.save(filename)
+
+# Corrected function to extract key from QR code
+def extract_key_from_qr(qr_image_path):
+    # Decode the QR code using OpenCV's QRCodeDetector
+    img = cv2.imread(qr_image_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    detector = cv2.QRCodeDetector()
+    value, _, _ = detector.detectAndDecode(gray)
+
+    if not value:
+        raise ValueError("Failed to decode QR code")
+
+    # Convert the decoded binary string back to a 45x45 binary matrix
+    binary_data = np.array([int(bit) for bit in value], dtype=np.uint8)
+    if len(binary_data) != 45 * 45:
+        raise ValueError(f"Decoded data length {len(binary_data)} does not match expected 45x45 ({45*45})")
+
+    return binary_data.reshape(45, 45)
+
+# Decode the QR image and extract the binary string
+def decode_qr_code(qr_image_path):
+    # Read the QR code image
+    img = cv2.imread(qr_image_path)
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Create QRCodeDetector object
+    detector = cv2.QRCodeDetector()
+    # Detect and decode the QR code
+    value, _, _ = detector.detectAndDecode(gray)
+    if value:
+        # Return the decoded binary string
+        return ''.join(value.split())
+    else:
+        return None
+
+# Verify the reconstructed key extraction
+def verify_extracted_key(keyTHM, reconstructed_qr_path):
+    # Decode the QR code from the reconstructed key
+    extracted_key_reshaped = extract_key_from_qr(reconstructed_qr_path)
+
+    # Verify extraction
+    extraction_correct = np.array_equal(keyTHM, extracted_key_reshaped)
+    print("Key extraction correct:", extraction_correct)
+
+    # Check how many values are incorrect between original and extracted keys
+    incorrect_values = np.sum(keyTHM != extracted_key_reshaped)
+    print(f"Number of incorrect values: {incorrect_values}")
+
+    if incorrect_values > 0:
+        # If there are mismatches, print out the indices of the first 10 mismatches
+        diff_indices = np.argwhere(keyTHM != extracted_key_reshaped)
+        print(f"First 10 differing indices: {diff_indices[:10]}")
+
+# Calculate normalized correlation
+def calculate_nc(original, extracted):
+    original = original.flatten().astype(float) / 255
+    extracted = extracted.flatten().astype(float) / 255
+    mean_orig = np.mean(original)
+    mean_ext = np.mean(extracted)
+    numerator = np.sum((original - mean_orig) * (extracted - mean_ext))
+    denominator = np.sqrt(np.sum((original - mean_orig) ** 2) * np.sum((extracted - mean_ext) ** 2))
+    nc = numerator / denominator if denominator != 0 else 0
+    return nc
+
+# Calculate entropy
+def calculate_entropy(image):
+    if len(image.shape) == 3:  # Color image
+        entropies = []
+        for ch in range(3):
+            hist, _ = np.histogram(image[:, :, ch].flatten(), bins=256, range=(0, 256), density=True)
+            ent = scipy_entropy(hist, base=2)
+            entropies.append(ent)
+        return np.mean(entropies)
     else:  # Grayscale image
-        watermarked_img = embed_watermark(host, encrypted_wm, alpha)
-    
-    cv2.imwrite(output_path, watermarked_img)
-    print(f'Watermarked image saved at {output_path}')
+        hist, _ = np.histogram(image.flatten(), bins=256, range=(0, 256), density=True)
+        return scipy_entropy(hist, base=2)
 
-# Example usage
+# Calculate metrics for grayscale or color images, including NC and entropy
+def calculate_metrics(original, watermarked_img, original_watermark=None, extracted_watermark=None, stage="Embedding"):
+    is_color = len(original.shape) == 3
 
-watermark_image('colour img.webp', 'grey watermark.webp', 'output.webp')
+    if is_color:
+        mse = np.mean((original.astype(np.float32) - watermarked_img.astype(np.float32)) ** 2, axis=(0, 1))
+        mse_avg = np.mean(mse)
+        psnr = 10 * np.log10(255 ** 2 / mse_avg) if mse_avg > 0 else 100
+        ssim_scores = []
+        for ch in range(3):
+            win_size = min(11, min(original.shape[:2]))
+            ssim_score = ssim(original[:, :, ch], watermarked_img[:, :, ch],
+                            data_range=255, win_size=win_size)
+            ssim_scores.append(ssim_score)
+        ssim_avg = np.mean(ssim_scores)
+        entropy_orig = calculate_entropy(original)
+        entropy_watermarked = calculate_entropy(watermarked_img)
+    else:
+        mse = np.mean((original.astype(np.float32) - watermarked_img.astype(np.float32)) ** 2)
+        psnr = 10 * np.log10(255 ** 2 / mse) if mse > 0 else 100
+        win_size = min(11, min(original.shape[:2]))
+        ssim_avg = ssim(original, watermarked_img, data_range=255, win_size=win_size)
+        entropy_orig = calculate_entropy(original)
+        entropy_watermarked = calculate_entropy(watermarked_img)
+
+    # Calculate NC if watermark data is provided
+    nc = None
+    if original_watermark is not None and extracted_watermark is not None:
+        nc = calculate_nc(original_watermark, extracted_watermark)
+
+    print(f"{stage} Metrics:")
+    print(f"MSE: {mse_avg:.2f}" if is_color else f"MSE: {mse:.2f}")
+    print(f"PSNR: {psnr:.2f} dB")
+    print(f"SSIM: {ssim_avg:.4f}")
+    print(f"Original Image Entropy: {entropy_orig:.4f} bits")
+    print(f"Watermarked Image Entropy: {entropy_watermarked:.4f} bits")
+    if nc is not None:
+        print(f"Normalized Correlation (NC): {nc:.4f}")
+
+    return mse, psnr, ssim_avg, nc, entropy_orig, entropy_watermarked
+
+# Main execution
+if __name__ == "__main__":
+    # Configurable chaotic map parameters
+    TENT_X0 = 0.36
+    TENT_ALPHA = 1.98
+    HENON_X0 = 0.51
+    HENON_Y0 = 0.3
+    HENON_ALPHA = 1.4
+    HENON_BETA = 1.314
+    T = 0.05  # Optimal threshold; test 0.08 or 0.12 if needed
+
+    # Load host image (color or grayscale)
+    # Use PNG to avoid lossy compression issues
+    host_image = cv2.imread('image.webp', cv2.IMREAD_COLOR)
+    if host_image is None:
+        raise ValueError("Failed to load host image. Ensure 'image.jpeg' exists.")
+
+    patient_data = "Patient ID: 12345, Name: John Doe, Date: 2025-04-07"
+    watermark = generate_qr_watermark(patient_data)
+
+    # Resize host image to 1024x1024 if necessary
+    is_color = len(host_image.shape) == 3
+    target_size = (1024, 1024)
+    if host_image.shape[:2] != target_size:
+        if is_color:
+            host_image = cv2.resize(host_image, target_size, interpolation=cv2.INTER_AREA)
+        else:
+            host_image = cv2.resize(host_image, target_size, interpolation=cv2.INTER_AREA)
+        print(f"Resized host image to {target_size[0]}×{target_size[1]}.")
+
+    if watermark.shape != (45, 45):
+        raise ValueError("Watermark must be 45×45.")
+
+    padded_or_wm = cv2.copyMakeBorder(watermark, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=255)
+    cv2.imwrite('original_qr.png',padded_or_wm)
+
+    enc_watermark, keyTHM = encrypt_watermark(
+        watermark,
+        tent_x0=TENT_X0,
+        tent_alpha=TENT_ALPHA,
+        henon_x0=HENON_X0,
+        henon_y0=HENON_Y0,
+        henon_alpha=HENON_ALPHA,
+        henon_beta=HENON_BETA
+    )
+    print("Encrypted watermark saved as 'Enc_watermark.png'.")
+
+    N = 3  # Number of shares (n,n threshold)
+
+    # Step 2: Convert the THM key to QR code
+    qr_code = key_to_qr_code(keyTHM)
+
+    # Step 3: Save the QR code
+    save_qr_code_image(qr_code, "keyTHM_qr_code.png")
+
+    # Step 4: Generate shares from QR code
+    shares = generate_shares(keyTHM, N)
+
+    # Step 5: Encode shares into QR codes
+    for idx, share in enumerate(shares):
+        qr_share = key_to_qr_code(share)  # Convert share to QR code
+        filename = f"share_{idx+1}.png"
+        save_qr_code_image(qr_share, filename)
+
+    # Step 6: Reconstruct the secret key from shares
+    reconstructed = reconstruct_secret(shares)
+
+    # Step 7: Save reconstructed QR code
+    reconstructed_qr_code = key_to_qr_code(reconstructed)
+    save_qr_code_image(reconstructed_qr_code, "reconstructed_keyTHM.png")
+
+    # Step 8: Verify reconstruction correctness
+    is_correct = np.array_equal(keyTHM, reconstructed)
+    print("Reconstruction correct:", is_correct)
+
+    # Step 9: Decode the QR code from the reconstructed key
+    extracted_key = extract_key_from_qr("reconstructed_keyTHM.png")
+
+    # Step 10: Verify extraction
+    extraction_correct = np.array_equal(keyTHM, extracted_key)
+    print("Key extraction correct:", extraction_correct)
+
+    # Step 11: Decode the QR code and print part of the value
+    decoded_key = decode_qr_code("reconstructed_keyTHM.png")
+    print(f"Decoded value from QR: {decoded_key[:10]}..." if decoded_value else "Failed to decode QR")
+
+    # Step 12: Detailed verification of extracted key
+    verify_extracted_key(keyTHM, "reconstructed_keyTHM.png")
+
+    # Embed watermark (in blue channel for color images)
+    watermarked_image, embedded_bits = embed_watermark(host_image, enc_watermark, T=T,
+                                                    channel=2 if is_color else 0)
+    cv2.imwrite('watermarked_img.png', watermarked_image)
+    calculate_metrics(host_image, watermarked_image, stage="Embedding")
+
+    # Extract and decrypt watermark
+    enc_watermark_extracted, extracted_bits = extract_watermark(watermarked_image, T=T,
+                                                             watermark_size=(45, 45),
+                                                             channel=2 if is_color else 0)
+    # Calculate Bit Error Rate (BER)
+    ber = np.mean(embedded_bits != extracted_bits)
+    print(f"Bit Error Rate (BER): {ber:.4f} ({np.sum(embedded_bits != extracted_bits)} bits incorrect)")
+    if ber > 0:
+        error_indices = np.where(embedded_bits != extracted_bits)[0]
+        print(f"Bit error indices (first 10): {error_indices[:10]}")
+        print(f"Sample embedded bits (first 50): {embedded_bits[:10]}")
+        print(f"Sample extracted bits (first 50): {extracted_bits[:10]}")
+
+    dec_watermark = decrypt_watermark(enc_watermark_extracted, decoded_key)
+    print("Watermark extracted and decrypted. Match:", np.array_equal(watermark, dec_watermark))
+    if not np.array_equal(watermark, dec_watermark):
+        diff = watermark != dec_watermark
+        diff_indices = np.where(diff.flatten())[0]
+        print(f"Pixel difference indices (first 10): {diff_indices[:10]}")
+        print(f"Original watermark pixels (first 10): {watermark.flatten()[:10]}")
+        print(f"Decrypted watermark pixels (first 10): {dec_watermark.flatten()[:10]}")
+
+    # Calculate metrics including NC and entropy for watermark
+    calculate_metrics(host_image, watermarked_image, watermark, dec_watermark, stage="Extraction")
+
+    # Pad the decrypted watermark to restore 4-module quiet zone (border)
+    padded_dec_wm = cv2.copyMakeBorder(dec_watermark, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=255)
+    cv2.imwrite('padded_decrypted_qr.png', padded_dec_wm)
+    img = cv2.imread('padded_decrypted_qr.png', cv2.IMREAD_GRAYSCALE)
+    _, binary_img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+    qr_detector = cv2.QRCodeDetector()
+    data, points, _ = qr_detector.detectAndDecode(binary_img)
+    if data:
+        print("✅ Decoded QR Code Data (after padding):", data)
+    else:
+        print("❌ Still cannot decode after padding.")
+
+    # Visualization
+    plt.figure(figsize=(15, 3))
+    plt.subplot(1, 5, 1)
+    plt.title("Original Host")
+    if is_color:
+        plt.imshow(cv2.cvtColor(host_image, cv2.COLOR_BGR2RGB))
+    else:
+        plt.imshow(host_image, cmap='gray')
+    plt.axis('off')
+
+    plt.subplot(1, 5, 2)
+    plt.title("Watermarked Host")
+    if is_color:
+        plt.imshow(cv2.cvtColor(watermarked_image, cv2.COLOR_BGR2RGB))
+    else:
+        plt.imshow(watermarked_image, cmap='gray')
+    plt.axis('off')
+
+    plt.subplot(1, 5, 3)
+    plt.title("Original QR Watermark")
+    plt.imshow(watermark, cmap='gray')
+    plt.axis('off')
+
+    plt.subplot(1, 5, 4)
+    plt.title("Decrypted QR Watermark")
+    plt.imshow(dec_watermark, cmap='gray')
+    plt.axis('off')
+
+    plt.subplot(1, 5, 5)
+    plt.title("Encrypted QR Watermark")
+    cv2.imwrite('Enc_watermark.png', enc_watermark * 255)  # Scale for visibility
+    plt.imshow(enc_watermark, cmap='gray')
+    plt.axis('off')
+
+    plt.tight_layout()
+    plt.savefig('watermarking_results.png')
+    plt.close()
